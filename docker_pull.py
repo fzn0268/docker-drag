@@ -1,4 +1,5 @@
 import os
+import platform
 import sys
 import gzip
 from io import BytesIO
@@ -10,8 +11,54 @@ import tarfile
 import urllib3
 urllib3.disable_warnings()
 
-if len(sys.argv) != 2 :
-	print('Usage:\n\tdocker_pull.py [registry/][repository/]image[:tag|@digest]\n')
+# https://stackoverflow.com/questions/70811277/enumerate-current-running-platform-information-in-python
+_ARCHITECTURE_DICT = {
+    # For Windows, it uses PROCESSOR_ARCHITECTURE environment variable. Reference:
+    # https://learn.microsoft.com/en-us/windows/win32/winprog64/wow64-implementation-details#environment-variables
+    # https://github.com/python/cpython/blob/main/Lib/platform.py#L717-L727
+    "Windows": {
+        "AMD64": "amd64",
+        "X86": "386",
+        "ARM64": "arm64",
+    },
+    # For Unix-like system, it follows os.uname result. Reference:
+    # https://en.wikipedia.org/wiki/Uname
+    "Linux": {
+        "x86_64": "amd64",
+        "i686": "386",
+        "i386": "386",
+        "aarch64": "arm64",
+        "armv7l": "armv7",
+    },
+    "Darwin": {
+        "x86_64": "amd64",
+        "arm64": "arm64",
+    },
+}
+
+_SYSTEM_DICT = {
+    "Windows": "windows",
+    "Linux": "linux",
+    "Darwin": "darwin",
+}
+
+
+def _get_platform():
+    uname = platform.uname()
+    try:
+        system = _SYSTEM_DICT[uname.system]
+        architecture = _ARCHITECTURE_DICT[uname.system][uname.machine]
+    except KeyError:
+        raise RuntimeError(
+            f"Unsupported platform: {uname.system} {uname.machine}"
+        ) from None
+    return system, architecture
+
+
+GOOS, GOARCH = _get_platform()
+
+if len(sys.argv) < 2 or len(sys.argv) > 4 :
+	print('Usage:\n\tdocker_pull.py [registry/][repository/]image[:tag|@digest] [amd64|arm64|...] [linux|windows|...]\n')
 	exit(1)
 
 # Look for the Docker image to download
@@ -22,7 +69,7 @@ try:
     img,tag = imgparts[-1].split('@')
 except ValueError:
 	try:
-	    img,tag = imgparts[-1].split(':')
+		img,tag = imgparts[-1].split(':')
 	except ValueError:
 		img = imgparts[-1]
 # Docker client doesn't seem to consider the first element as a potential registry unless there is a '.' or ':'
@@ -36,6 +83,8 @@ else:
 	else:
 		repo = 'library'
 repository = '{}/{}'.format(repo, img)
+architecture = sys.argv[2] if len(sys.argv) > 2 else 'amd64'
+osname = sys.argv[3] if len(sys.argv) > 3 else 'linux'
 
 # Get Docker authentication endpoint when it is required
 auth_url='https://auth.docker.io/token'
@@ -69,13 +118,14 @@ def progress_bar(ublob, nb_traits):
 	sys.stdout.flush()
 
 # Fetch manifest v2 and get image layer digests
-auth_head = get_auth_head('application/vnd.docker.distribution.manifest.v2+json')
+auth_head = get_auth_head('application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json;q=0.9')
 resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, tag), headers=auth_head, verify=False)
 if (resp.status_code != 200):
 	print('[-] Cannot fetch manifest for {} [HTTP {}]'.format(repository, resp.status_code))
 	print(resp.content)
-	auth_head = get_auth_head('application/vnd.docker.distribution.manifest.list.v2+json')
+	auth_head = get_auth_head('application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json;q=0.9')
 	resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, tag), headers=auth_head, verify=False)
+	hit = False
 	if (resp.status_code == 200):
 		print('[+] Manifests found for this tag (use the @digest format to pull the corresponding image):')
 		manifests = resp.json()['manifests']
@@ -83,13 +133,20 @@ if (resp.status_code != 200):
 			for key, value in manifest["platform"].items():
 				sys.stdout.write('{}: {}, '.format(key, value))
 			print('digest: {}'.format(manifest["digest"]))
-	exit(1)
+			if manifest['platform']['architecture'] == architecture and manifest['platform']['os'] == osname:
+				hit = True
+				tag = manifest["digest"]
+				print('choose digest: {}'.format(tag))
+				resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, tag), headers=auth_head, verify=False)
+	if not hit:
+		exit(1)
 layers = resp.json()['layers']
 
 # Create tmp folder that will hold the image
 imgdir = 'tmp_{}_{}'.format(img, tag.replace(':', '@'))
-os.mkdir(imgdir)
-print('Creating image structure in: ' + imgdir)
+if not os.path.exists(imgdir):
+	os.mkdir(imgdir)
+	print('Creating image structure in: ' + imgdir)
 
 config = resp.json()['config']['digest']
 confresp = requests.get('https://{}/v2/{}/blobs/{}'.format(registry, repository, config), headers=auth_head, verify=False)
@@ -118,7 +175,19 @@ for layer in layers:
 	# FIXME: Creating fake layer ID. Don't know how Docker generates it
 	fake_layerid = hashlib.sha256((parentid+'\n'+ublob+'\n').encode('utf-8')).hexdigest()
 	layerdir = imgdir + '/' + fake_layerid
-	os.mkdir(layerdir)
+	if not os.path.exists(layerdir):
+		os.mkdir(layerdir)
+
+	if os.path.exists(layerdir + '/json'):
+		if layers[-1]['digest'] == layer['digest']:
+			json_obj = json.loads(confresp.content)
+		else:
+			json_obj = json.loads(empty_json)
+		json_obj['id'] = fake_layerid
+		if parentid:
+			json_obj['parent'] = parentid
+		parentid = json_obj['id']
+		continue
 
 	# Creating VERSION file
 	file = open(layerdir + '/VERSION', 'w')
@@ -128,14 +197,15 @@ for layer in layers:
 	# Creating layer.tar file
 	sys.stdout.write(ublob[7:19] + ': Downloading...')
 	sys.stdout.flush()
-	auth_head = get_auth_head('application/vnd.docker.distribution.manifest.v2+json') # refreshing token to avoid its expiration
-	bresp = requests.get('https://{}/v2/{}/blobs/{}'.format(registry, repository, ublob), headers=auth_head, stream=True, verify=False)
+	auth_head = get_auth_head('application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json;q=0.9') # refreshing token to avoid its expiration
+	bresp = requests.get('https://{}/v2/{}/blobs/{}'.format(registry, repository, ublob), headers=auth_head, stream=True, verify=False, allow_redirects=True)
 	if (bresp.status_code != 200): # When the layer is located at a custom URL
-		bresp = requests.get(layer['urls'][0], headers=auth_head, stream=True, verify=False)
-		if (bresp.status_code != 200):
-			print('\rERROR: Cannot download layer {} [HTTP {}]'.format(ublob[7:19], bresp.status_code, bresp.headers['Content-Length']))
-			print(bresp.content)
-			exit(1)
+		if layer.get('urls'):
+			bresp = requests.get(layer['urls'][0], headers=auth_head, stream=True, verify=False)
+			if (bresp.status_code != 200):
+				print('\rERROR: Cannot download layer {} [HTTP {}]'.format(ublob[7:19], bresp.status_code, bresp.headers['Content-Length']))
+				print(bresp.content)
+				exit(1)
 	# Stream download and follow the progress
 	bresp.raise_for_status()
 	unit = int(bresp.headers['Content-Length']) / 50
@@ -180,6 +250,8 @@ for layer in layers:
 	parentid = json_obj['id']
 	file.write(json.dumps(json_obj))
 	file.close()
+ 
+ 
 
 file = open(imgdir + '/manifest.json', 'w')
 file.write(json.dumps(content))
